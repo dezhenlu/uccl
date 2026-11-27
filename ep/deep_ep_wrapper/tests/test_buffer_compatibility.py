@@ -322,3 +322,111 @@ def test_config_check_ships_with_the_wrapper(isolated_deep_ep_import):
     # Not a top-level config_check that happens to be importable from ep/bench.
     check = sys.modules["deep_ep.buffer"].check_consistency
     assert check.__module__ == "deep_ep.config_check"
+
+
+class _LLTensor(_FakeTensor):
+    _next_ptr = 0x1000
+
+    def __init__(self, shape, *, dtype="bf16", device="cuda:0"):
+        super().__init__(shape, dtype=dtype)
+        self.device = device
+        _LLTensor._next_ptr += 0x1000
+        self._ptr = _LLTensor._next_ptr
+
+    def data_ptr(self):
+        return self._ptr
+
+
+class _FakeLLRuntime:
+    def __init__(self):
+        self.combine_args = None
+
+    def low_latency_combine(self, *args):
+        self.combine_args = args
+        return None, None
+
+
+_LL_NUM_EXPERTS, _LL_MAX_TOKENS, _LL_HIDDEN = 4, 3, 8
+# group size 2 -> 2 local experts, 2 * 3 receive slots per expert.
+_LL_X_SHAPE = (2, 6, _LL_HIDDEN)
+
+
+def _ll_setup(monkeypatch, handle_device, current_device=0):
+    deep_ep, _ = _load_deep_ep_wrapper(monkeypatch, lambda: current_device)
+    torch = sys.modules["torch"]
+    torch.bfloat16 = "bf16"
+
+    def empty(shape, *, dtype=None, device="cuda"):
+        # Like torch: "cuda" means the current device.
+        if device == "cuda":
+            device = f"cuda:{current_device}"
+        return _LLTensor(shape, dtype=dtype, device=device)
+
+    monkeypatch.setattr(torch, "empty", empty, raising=False)
+    runtime = _FakeLLRuntime()
+    buffer = _new_buffer(deep_ep, runtime)
+    buffer._next_low_latency_combine_buffer = None
+    handle = (
+        _LLTensor((2, 6), dtype="int32", device=handle_device),
+        _LLTensor((2, 2), dtype="int64", device=handle_device),
+        _LL_MAX_TOKENS,
+        _LL_HIDDEN,
+        _LL_NUM_EXPERTS,
+    )
+    return deep_ep, buffer, runtime, handle
+
+
+def _ll_combine(deep_ep, buffer, x, handle, zero_copy):
+    topk = _LLTensor((3, 2), dtype="int64", device=x.device)
+    weights = _LLTensor((3, 2), dtype="float32", device=x.device)
+    deep_ep.Buffer.low_latency_combine(
+        buffer, x, topk, weights, handle, zero_copy=zero_copy
+    )
+
+
+def test_ll_combine_staging_follows_handle_device(isolated_deep_ep_import):
+    # The current device is cuda:0, the dispatch handle lives on cuda:1.
+    deep_ep, buffer, runtime, handle = _ll_setup(
+        isolated_deep_ep_import, handle_device="cuda:1"
+    )
+    staged = deep_ep.Buffer.get_next_low_latency_combine_buffer(buffer, handle)
+    assert staged.device == "cuda:1"
+    assert staged.shape == _LL_X_SHAPE
+
+    x = _LLTensor(_LL_X_SHAPE, device="cuda:1")
+    _ll_combine(deep_ep, buffer, x, handle, zero_copy=True)
+    assert runtime.combine_args[0] == staged.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "x_kwargs",
+    [
+        {"shape": (2, 5, _LL_HIDDEN)},
+        {"dtype": "fp16"},
+        {"device": "cuda:1"},
+    ],
+    ids=["shape", "dtype", "device"],
+)
+def test_ll_combine_zero_copy_mismatch_raises(isolated_deep_ep_import, x_kwargs):
+    deep_ep, buffer, runtime, handle = _ll_setup(
+        isolated_deep_ep_import, handle_device="cuda:0"
+    )
+    deep_ep.Buffer.get_next_low_latency_combine_buffer(buffer, handle)
+    x = _LLTensor(x_kwargs.pop("shape", _LL_X_SHAPE), **x_kwargs)
+
+    with pytest.raises(ValueError, match="zero_copy=True"):
+        _ll_combine(deep_ep, buffer, x, handle, zero_copy=True)
+    assert runtime.combine_args is None
+
+
+@pytest.mark.parametrize("stage", [False, True])
+def test_ll_combine_uses_x_without_zero_copy_staging(isolated_deep_ep_import, stage):
+    deep_ep, buffer, runtime, handle = _ll_setup(
+        isolated_deep_ep_import, handle_device="cuda:0"
+    )
+    if stage:
+        # A staged buffer is ignored when zero_copy is off.
+        deep_ep.Buffer.get_next_low_latency_combine_buffer(buffer, handle)
+    x = _LLTensor(_LL_X_SHAPE)
+    _ll_combine(deep_ep, buffer, x, handle, zero_copy=not stage)
+    assert runtime.combine_args[0] == x.data_ptr()

@@ -642,12 +642,21 @@ class Buffer:
         x_for_combine = x
         if zero_copy and self._next_low_latency_combine_buffer is not None:
             staged = self._next_low_latency_combine_buffer
+            # The caller filled `staged`, so combining `x` instead would send
+            # different data without any error. Refuse a mismatch.
             if (
-                staged.shape == x.shape
-                and staged.dtype == x.dtype
-                and staged.device == x.device
+                staged.shape != x.shape
+                or staged.dtype != x.dtype
+                or staged.device != x.device
             ):
-                x_for_combine = staged
+                raise ValueError(
+                    "low_latency_combine(zero_copy=True): the buffer from "
+                    "get_next_low_latency_combine_buffer() has shape "
+                    f"{tuple(staged.shape)}, dtype {staged.dtype}, device "
+                    f"{staged.device}, but x has shape {tuple(x.shape)}, "
+                    f"dtype {x.dtype}, device {x.device}"
+                )
+            x_for_combine = staged
         combined_x = (
             out
             if out is not None
